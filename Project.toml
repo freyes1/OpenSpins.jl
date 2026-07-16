@@ -1,0 +1,14 @@
+name = "OpenSpins"
+uuid = "9b8a731e-59d3-4af8-bfe3-7b609265aa58"
+version = "0.1.0"
+
+[deps]
+Cubature = "667455a9-e2ce-5579-9412-b964f529a492"
+Integrals = "de52edbc-65ea-441a-8357-d3a637375a31"
+Interpolations = "a98d9a8b-a2ab-59e6-89dd-64a1c18fca59"
+KadanoffBaym = "82532805-809c-4ef0-842b-4b00c5e9be5f"
+TransmuteDims = "24ddb15e-299a-5cc3-8414-dbddc482d9ca"
+Tullio = "bc48ee85-29a4-5162-ae0b-a64e1601d4bc"
+
+[compat]
+julia = "1.10"
