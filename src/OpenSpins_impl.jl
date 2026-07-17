@@ -746,6 +746,8 @@ mutable struct SimulationState{I, G1, G2, G3, G4, G5, G6, G7, G8, G9, G10, G11, 
     heff::Array{ComplexF64, 4}            # (n, a, b, t)
     spin_spin_scale::Vector{Float64}
     spin_bath_scale::Vector{Float64}
+    has_exchange_coupling::Bool
+    has_bath_coupling::Bool
     scratch::Vector{OpenSpinsScratch}
     mcheck_endpoint_cache::McheckEndpointCache
     weight_history::Vector{Vector{Float64}}  # adaptive quadrature weights per upper index
@@ -775,6 +777,8 @@ function initialize_state(params::OpenSpinsParameters, kernels::KernelBundle, in
     ndiss = length(params.dissipative_spins)
     spin_spin_scale = [params.spin_spin_profile(0.0)]
     spin_bath_scale = [params.spin_bath_profile(0.0)]
+    has_exchange_coupling = any(x -> !iszero(x), params.J)
+    has_bath_coupling = any(kernels.has_channel)
 
     gK = GreenFunction(zeros(ComplexF64, params.n_spins, N_FIELD, N_FIELD, 1, 1), SymmetricSiteField)
     gs = GreenFunction(zeros(ComplexF64, params.n_spins, N_FIELD, N_FIELD, 1, 1), AntiSymmetricSiteField)
@@ -835,6 +839,8 @@ function initialize_state(params::OpenSpinsParameters, kernels::KernelBundle, in
         heff,
         spin_spin_scale,
         spin_bath_scale,
+        has_exchange_coupling,
+        has_bath_coupling,
         _make_thread_scratch(params.n_spins),
         McheckEndpointCache(),
         [Float64[]],
@@ -975,6 +981,22 @@ end
     state.spin_spin_scale[t2] = state.params.spin_spin_profile(ts[t2])
     state.spin_bath_scale[t2] = state.params.spin_bath_profile(ts[t2])
     return nothing
+end
+
+@inline function _bath_pair_active(state::SimulationState, t1::Int, t2::Int)
+    return state.has_bath_coupling &&
+           !iszero(state.spin_bath_scale[t1]) &&
+           !iszero(state.spin_bath_scale[t2])
+end
+
+@inline function _exchange_pair_active(state::SimulationState, t1::Int, t2::Int)
+    return state.has_exchange_coupling &&
+           !iszero(state.spin_spin_scale[t1]) &&
+           !iszero(state.spin_spin_scale[t2])
+end
+
+@inline function _self_energy_pair_active(state::SimulationState, t1::Int, t2::Int)
+    return _bath_pair_active(state, t1, t2) || _exchange_pair_active(state, t1, t2)
 end
 
 @inline function _ensure_weight_slot!(state::SimulationState, idx::Int)
@@ -1266,6 +1288,20 @@ end
     return rhs / denom
 end
 
+function _zero_bath_propagator_pair!(state::SimulationState, t1::Int, t2::Int)
+    dK_data = state.dK.data
+    ds_data = state.ds.data
+    @inbounds for d in axes(dK_data, 1), alpha in axes(dK_data, 2)
+        dK_data[d, alpha, t1, t2] = 0.0 + 0.0im
+        ds_data[d, alpha, t1, t2] = 0.0 + 0.0im
+        if t1 != t2
+            dK_data[d, alpha, t2, t1] = 0.0 + 0.0im
+            ds_data[d, alpha, t2, t1] = 0.0 + 0.0im
+        end
+    end
+    return nothing
+end
+
 @inline _na_index(n::Int, alpha::Int) = (n - 1) * N_COMP + alpha
 
 function _build_mcheck_endpoint_operator!(op::Matrix{ComplexF64}, state::SimulationState, t1::Int)
@@ -1325,6 +1361,13 @@ function _mcheck_endpoint_factors!(state::SimulationState, w1, t1::Int)
 end
 
 function _update_bath_propagator!(state::SimulationState, ts::Vector{<:Real}, w1, w2, t1::Int, t2::Int)
+    if !_bath_pair_active(state, t1, t2)
+        # Endpoint dressing makes this pair exactly zero; retain the dense zero
+        # so a later turn-on can reuse the untouched earlier history.
+        _zero_bath_propagator_pair!(state, t1, t2)
+        return nothing
+    end
+
     ndiss = length(state.params.dissipative_spins)
     dK_data = state.dK.data
     ds_data = state.ds.data
@@ -1469,7 +1512,28 @@ function _update_bath_propagator!(state::SimulationState, ts::Vector{<:Real}, w1
     return nothing
 end
 
+function _zero_self_energy_pair!(state::SimulationState, t1::Int, t2::Int)
+    sigmaK_data = state.sigmaK.data
+    sigmas_data = state.sigmas.data
+    @inbounds for n in axes(sigmaK_data, 1), i in axes(sigmaK_data, 2), l in axes(sigmaK_data, 3)
+        sigmaK_data[n, i, l, t1, t2] = 0.0 + 0.0im
+        sigmas_data[n, i, l, t1, t2] = 0.0 + 0.0im
+        if t1 != t2
+            sigmaK_data[n, l, i, t2, t1] = 0.0 + 0.0im
+            sigmas_data[n, l, i, t2, t1] = 0.0 + 0.0im
+        end
+    end
+    return nothing
+end
+
 function _update_self_energies!(state::SimulationState, t1::Int, t2::Int)
+    bath_pair_active = _bath_pair_active(state, t1, t2)
+    exchange_pair_active = _exchange_pair_active(state, t1, t2)
+    if !bath_pair_active && !exchange_pair_active
+        _zero_self_energy_pair!(state, t1, t2)
+        return nothing
+    end
+
     n_spins = state.params.n_spins
     J = state.params.J
     gK_data = state.gK.data
@@ -1486,48 +1550,54 @@ function _update_self_energies!(state::SimulationState, t1::Int, t2::Int)
 
     for n in 1:n_spins
         d = state.kernels.spin_to_diss[n]
-        @inbounds for alpha in 1:N_COMP, beta in 1:N_COMP
-            jmjK[alpha, beta] = _dressed_jmj_diag_entry(
-                mK_data, J, n, alpha, beta, t1, t2, left_exchange_scale, right_exchange_scale,
-            )
-            jmjs[alpha, beta] = _dressed_jmj_diag_entry(
-                ms_data, J, n, alpha, beta, t1, t2, left_exchange_scale, right_exchange_scale,
-            )
+        if exchange_pair_active
+            @inbounds for alpha in 1:N_COMP, beta in 1:N_COMP
+                jmjK[alpha, beta] = _dressed_jmj_diag_entry(
+                    mK_data, J, n, alpha, beta, t1, t2, left_exchange_scale, right_exchange_scale,
+                )
+                jmjs[alpha, beta] = _dressed_jmj_diag_entry(
+                    ms_data, J, n, alpha, beta, t1, t2, left_exchange_scale, right_exchange_scale,
+                )
+            end
         end
 
         @inbounds for i in 1:N_FIELD, l in 1:N_FIELD
             sK = 0.0 + 0.0im
             ss = 0.0 + 0.0im
 
-            for alpha in 1:N_COMP
-                Ka = K_MATRICES[alpha]
-                bathK = (d == 0) ? (0.0 + 0.0im) : state.dK.data[d, alpha, t1, t2]
-                baths = (d == 0) ? (0.0 + 0.0im) : state.ds.data[d, alpha, t1, t2]
+            if bath_pair_active && d != 0
+                for alpha in 1:N_COMP
+                    Ka = K_MATRICES[alpha]
+                    bathK = state.dK.data[d, alpha, t1, t2]
+                    baths = state.ds.data[d, alpha, t1, t2]
 
-                gKg = 0.0 + 0.0im
-                gsg = 0.0 + 0.0im
-                for j in 1:N_FIELD, k in 1:N_FIELD
-                    gKg += Ka[i, j] * gK_data[n, j, k, t1, t2] * Ka[k, l]
-                    gsg += Ka[i, j] * gs_data[n, j, k, t1, t2] * Ka[k, l]
+                    gKg = 0.0 + 0.0im
+                    gsg = 0.0 + 0.0im
+                    for j in 1:N_FIELD, k in 1:N_FIELD
+                        gKg += Ka[i, j] * gK_data[n, j, k, t1, t2] * Ka[k, l]
+                        gsg += Ka[i, j] * gs_data[n, j, k, t1, t2] * Ka[k, l]
+                    end
+                    sK += 0.125im * (gKg * bathK + gsg * baths)
+                    ss += 0.125im * (gKg * baths + gsg * bathK)
                 end
-                sK += 0.125im * (gKg * bathK + gsg * baths)
-                ss += 0.125im * (gKg * baths + gsg * bathK)
             end
 
-            for alpha in 1:N_COMP, beta in 1:N_COMP
-                Ka = K_MATRICES[alpha]
-                Kb = K_MATRICES[beta]
-                mk = jmjK[alpha, beta]
-                ms = jmjs[alpha, beta]
+            if exchange_pair_active
+                for alpha in 1:N_COMP, beta in 1:N_COMP
+                    Ka = K_MATRICES[alpha]
+                    Kb = K_MATRICES[beta]
+                    mk = jmjK[alpha, beta]
+                    ms = jmjs[alpha, beta]
 
-                gKg = 0.0 + 0.0im
-                gsg = 0.0 + 0.0im
-                for j in 1:N_FIELD, k in 1:N_FIELD
-                    gKg += Ka[i, j] * gK_data[n, j, k, t1, t2] * Kb[k, l]
-                    gsg += Ka[i, j] * gs_data[n, j, k, t1, t2] * Kb[k, l]
+                    gKg = 0.0 + 0.0im
+                    gsg = 0.0 + 0.0im
+                    for j in 1:N_FIELD, k in 1:N_FIELD
+                        gKg += Ka[i, j] * gK_data[n, j, k, t1, t2] * Kb[k, l]
+                        gsg += Ka[i, j] * gs_data[n, j, k, t1, t2] * Kb[k, l]
+                    end
+                    sK += 0.125im * (gKg * mk + gsg * ms)
+                    ss += 0.125im * (gKg * ms + gsg * mk)
                 end
-                sK += 0.125im * (gKg * mk + gsg * ms)
-                ss += 0.125im * (gKg * ms + gsg * mk)
             end
 
             sigmaK_data[n, i, l, t1, t2] = sK
@@ -1570,11 +1640,12 @@ function _update_fields_diagonal!(state::SimulationState, ts::Vector{<:Real}, wd
         Lambda_bar[n, alpha, t] = 0.25im * x
 
         d = state.kernels.spin_to_diss[n]
-        if d == 0 || !state.kernels.has_channel[d, alpha]
+        if d == 0 || !state.kernels.has_channel[d, alpha] || iszero(state.spin_bath_scale[t])
             lambda_bar[n, alpha, t] = 0.0 + 0.0im
         else
             y = 0.0 + 0.0im
             for s in 1:t
+                iszero(state.spin_bath_scale[s]) && continue
                 y += wdiag[s] * _xis(state, d, alpha, ts, t, s) * tr_hist[n, alpha, s]
             end
             lambda_bar[n, alpha, t] = 0.25im * y
@@ -1662,36 +1733,48 @@ function _fv_arrays!(dgK::Array{ComplexF64, 3}, dgs::Array{ComplexF64, 3}, state
             fill!(colls, 0.0 + 0.0im)
         end
 
-        for s in 1:t1, i in 1:N_FIELD, l in 1:N_FIELD
-            acc = 0.0 + 0.0im
-            for j in 1:N_FIELD
-                acc += state.sigmas.data[n, i, j, t1, s] * state.gK.data[n, j, l, s, t2]
+        for s in 1:t1
+            _self_energy_pair_active(state, t1, s) || continue
+            for i in 1:N_FIELD, l in 1:N_FIELD
+                acc = 0.0 + 0.0im
+                for j in 1:N_FIELD
+                    acc += state.sigmas.data[n, i, j, t1, s] * state.gK.data[n, j, l, s, t2]
+                end
+                collK_1[i, l] += w1[s] * acc
             end
-            collK_1[i, l] += w1[s] * acc
         end
 
-        for s in 1:t2, i in 1:N_FIELD, l in 1:N_FIELD
-            acc = 0.0 + 0.0im
-            for j in 1:N_FIELD
-                acc += state.sigmaK.data[n, i, j, t1, s] * state.gs.data[n, j, l, s, t2]
+        for s in 1:t2
+            _self_energy_pair_active(state, t1, s) || continue
+            for i in 1:N_FIELD, l in 1:N_FIELD
+                acc = 0.0 + 0.0im
+                for j in 1:N_FIELD
+                    acc += state.sigmaK.data[n, i, j, t1, s] * state.gs.data[n, j, l, s, t2]
+                end
+                collK_2[i, l] += w2[s] * acc
             end
-            collK_2[i, l] += w2[s] * acc
         end
 
         if compute_spectral && (t1 != t2)
-            for s in 1:t1, i in 1:N_FIELD, l in 1:N_FIELD
-                acc = 0.0 + 0.0im
-                for j in 1:N_FIELD
-                    acc += state.sigmas.data[n, i, j, t1, s] * state.gs.data[n, j, l, s, t2]
+            for s in 1:t1
+                _self_energy_pair_active(state, t1, s) || continue
+                for i in 1:N_FIELD, l in 1:N_FIELD
+                    acc = 0.0 + 0.0im
+                    for j in 1:N_FIELD
+                        acc += state.sigmas.data[n, i, j, t1, s] * state.gs.data[n, j, l, s, t2]
+                    end
+                    colls[i, l] += w1[s] * acc
                 end
-                colls[i, l] += w1[s] * acc
             end
-            for s in 1:t2, i in 1:N_FIELD, l in 1:N_FIELD
-                acc = 0.0 + 0.0im
-                for j in 1:N_FIELD
-                    acc += state.sigmas.data[n, i, j, t1, s] * state.gs.data[n, j, l, s, t2]
+            for s in 1:t2
+                _self_energy_pair_active(state, t1, s) || continue
+                for i in 1:N_FIELD, l in 1:N_FIELD
+                    acc = 0.0 + 0.0im
+                    for j in 1:N_FIELD
+                        acc += state.sigmas.data[n, i, j, t1, s] * state.gs.data[n, j, l, s, t2]
+                    end
+                    colls[i, l] -= w2[s] * acc
                 end
-                colls[i, l] -= w2[s] * acc
             end
         end
 

@@ -137,4 +137,43 @@ end
     @test bath_result.audit.passed
     @test iszero(maximum(abs, bath_result.state.dK.data))
     @test iszero(maximum(abs, bath_result.state.ds.data))
+
+    reactivation_profile = InteractionProfile(
+        1.0;
+        events = [
+            Quench(0.001, 0.0),
+            Quench(0.002, 1.0),
+            Quench(0.004, 0.0),
+        ],
+    )
+    reactivation_params = OpenSpinsParameters(
+        n_spins = 1,
+        tmax = 0.005,
+        dissipative_spins = [1],
+        baths = [bath],
+        spin_bath_profile = reactivation_profile,
+        kernel_ntau = 33,
+        dtini = 0.001,
+        dtmax = 0.001,
+    )
+    reactivation_result = run_simulation(reactivation_params; save_output = false)
+    reactivation_t = reactivation_result.solution.t
+    reactivation_scale = reactivation_profile.(reactivation_t)
+    off_indices = findall(iszero, reactivation_scale)
+    reactivated_index = findfirst(i -> 0.002 <= reactivation_t[i] < 0.004, eachindex(reactivation_t))
+
+    @test reactivation_result.audit.passed
+    @test !isempty(off_indices)
+    @test reactivated_index !== nothing
+    @test all(
+        iszero(maximum(abs, reactivation_result.state.dK.data[:, :, i, j])) &&
+        iszero(maximum(abs, reactivation_result.state.ds.data[:, :, i, j])) &&
+        iszero(maximum(abs, reactivation_result.state.sigmaK.data[:, :, :, i, j])) &&
+        iszero(maximum(abs, reactivation_result.state.sigmas.data[:, :, :, i, j]))
+        for i in eachindex(reactivation_t), j in eachindex(reactivation_t)
+        if iszero(reactivation_scale[i]) || iszero(reactivation_scale[j])
+    )
+    @test maximum(abs, reactivation_result.state.piK.data[:, :, off_indices, off_indices]) > 0
+    @test maximum(abs, reactivation_result.state.dK.data[:, :, reactivated_index, 1]) > 0
+    @test maximum(abs, reactivation_result.state.sigmaK.data[:, :, :, reactivated_index, 1]) > 0
 end
