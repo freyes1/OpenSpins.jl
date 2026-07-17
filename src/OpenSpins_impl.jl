@@ -7,6 +7,10 @@ using Serialization
 using Printf
 
 export BathSpectrum
+export InteractionProfile
+export Quench
+export LinearRamp
+export SmoothRamp
 export OpenSpinsParameters
 export OpenSpinsInitialState
 export run_simulation
@@ -196,6 +200,120 @@ struct BathSpectrum
     n_omega::Int
 end
 
+abstract type AbstractInteractionEvent end
+
+"""Instantaneously set an interaction profile to `target` at `time`."""
+struct Quench <: AbstractInteractionEvent
+    time::Float64
+    target::Float64
+    function Quench(time::Real, target::Real)
+        isfinite(time) && time >= 0 || error("Quench time must be finite and non-negative.")
+        isfinite(target) || error("Quench target must be finite.")
+        new(Float64(time), Float64(target))
+    end
+end
+
+"""Linearly ramp from the currently held value to `target` over `[start, stop]`."""
+struct LinearRamp <: AbstractInteractionEvent
+    start::Float64
+    stop::Float64
+    target::Float64
+    function LinearRamp(start::Real, stop::Real, target::Real)
+        isfinite(start) && start >= 0 || error("Ramp start must be finite and non-negative.")
+        isfinite(stop) && stop > start || error("Ramp stop must be finite and greater than start.")
+        isfinite(target) || error("Ramp target must be finite.")
+        new(Float64(start), Float64(stop), Float64(target))
+    end
+end
+
+"""Smoothstep ramp from the currently held value to `target` over `[start, stop]`."""
+struct SmoothRamp <: AbstractInteractionEvent
+    start::Float64
+    stop::Float64
+    target::Float64
+    function SmoothRamp(start::Real, stop::Real, target::Real)
+        isfinite(start) && start >= 0 || error("Ramp start must be finite and non-negative.")
+        isfinite(stop) && stop > start || error("Ramp stop must be finite and greater than start.")
+        isfinite(target) || error("Ramp target must be finite.")
+        new(Float64(start), Float64(stop), Float64(target))
+    end
+end
+
+@inline _event_start(event::Quench) = event.time
+@inline _event_start(event::Union{LinearRamp, SmoothRamp}) = event.start
+@inline _event_stop(event::Quench) = event.time
+@inline _event_stop(event::Union{LinearRamp, SmoothRamp}) = event.stop
+
+"""
+Piecewise interaction scale with an initial value and ordered quench/ramp events.
+
+Quenches are right-continuous. A ramp starts from the value held at its `start`
+and holds its target after `stop`.
+"""
+struct InteractionProfile
+    initial::Float64
+    events::Vector{AbstractInteractionEvent}
+end
+
+function InteractionProfile(initial::Real = 1.0; events::AbstractVector = AbstractInteractionEvent[])
+    isfinite(initial) || error("Interaction profile initial value must be finite.")
+    normalized = AbstractInteractionEvent[]
+    previous_stop = -Inf
+    for event in events
+        event isa AbstractInteractionEvent || error("Unknown interaction profile event $(typeof(event)).")
+        start = _event_start(event)
+        start >= previous_stop || error("Interaction profile events must be ordered and non-overlapping.")
+        push!(normalized, event)
+        previous_stop = _event_stop(event)
+    end
+    return InteractionProfile(Float64(initial), normalized)
+end
+
+@inline function (profile::InteractionProfile)(time::Real)
+    t = Float64(time)
+    value = profile.initial
+    for event in profile.events
+        if event isa Quench
+            t < event.time && return value
+            value = event.target
+        else
+            t <= event.start && return value
+            if t < event.stop
+                x = (t - event.start) / (event.stop - event.start)
+                weight = event isa SmoothRamp ? x * x * (3 - 2x) : x
+                return muladd(weight, event.target - value, value)
+            end
+            value = event.target
+        end
+    end
+    return value
+end
+
+@inline _event_data(event::Quench) = (kind = :quench, start = event.time, stop = event.time, target = event.target)
+@inline _event_data(event::LinearRamp) = (kind = :linear_ramp, start = event.start, stop = event.stop, target = event.target)
+@inline _event_data(event::SmoothRamp) = (kind = :smooth_ramp, start = event.start, stop = event.stop, target = event.target)
+
+interaction_profile_data(profile::InteractionProfile) = (
+    initial = profile.initial,
+    events = [_event_data(event) for event in profile.events],
+)
+
+function InteractionProfile(data::NamedTuple)
+    events = AbstractInteractionEvent[]
+    for event in data.events
+        if event.kind === :quench
+            push!(events, Quench(event.start, event.target))
+        elseif event.kind === :linear_ramp
+            push!(events, LinearRamp(event.start, event.stop, event.target))
+        elseif event.kind === :smooth_ramp
+            push!(events, SmoothRamp(event.start, event.stop, event.target))
+        else
+            error("Unknown saved interaction profile event kind $(event.kind).")
+        end
+    end
+    return InteractionProfile(data.initial; events = events)
+end
+
 function BathSpectrum(
     spin::Integer,
     component::Integer;
@@ -231,8 +349,11 @@ struct OpenSpinsParameters
     J::Array{Float64, 4}              # (n, n', alpha, beta)
     dissipative_spins::Vector{Int}    # subset of 1:n_spins
     baths::Vector{BathSpectrum}
+    spin_spin_profile::InteractionProfile
+    spin_bath_profile::InteractionProfile
     tmax::Float64
     dtini::Float64
+    dtmax::Float64
     atol::Float64
     rtol::Float64
     kernel_ntau::Int
@@ -249,9 +370,12 @@ function OpenSpinsParameters(;
     J::AbstractArray{<:Real, 4} = zeros(Float64, Int(n_spins), Int(n_spins), N_COMP, N_COMP),
     dissipative_spins::AbstractVector{<:Integer} = Int[],
     baths::AbstractVector{BathSpectrum} = BathSpectrum[],
+    spin_spin_profile::InteractionProfile = InteractionProfile(),
+    spin_bath_profile::InteractionProfile = InteractionProfile(),
     dtini::Real = 1e-3,
-    atol::Real = 1e-8,
-    rtol::Real = 1e-6,
+    dtmax::Real = Inf,
+    atol::Real = 1e-5,
+    rtol::Real = 1e-5,
     kernel_ntau::Integer = 801,
     kernel_abstol::Real = 1e-9,
     kernel_reltol::Real = 1e-7,
@@ -262,6 +386,7 @@ function OpenSpinsParameters(;
     n >= 1 || error("n_spins must be >= 1.")
     tmax > 0 || error("tmax must be > 0.")
     dtini > 0 || error("dtini must be > 0.")
+    dtmax > 0 || error("dtmax must be > 0.")
     kernel_ntau >= 33 || error("kernel_ntau must be at least 33.")
 
     hmat = Matrix{Float64}(h)
@@ -284,8 +409,11 @@ function OpenSpinsParameters(;
         Jten,
         diss,
         collect(baths),
+        spin_spin_profile,
+        spin_bath_profile,
         Float64(tmax),
         Float64(dtini),
+        Float64(dtmax),
         Float64(atol),
         Float64(rtol),
         Int(kernel_ntau),
@@ -616,6 +744,8 @@ mutable struct SimulationState{I, G1, G2, G3, G4, G5, G6, G7, G8, G9, G10, G11, 
     lambda_bar::Array{ComplexF64, 3}      # (n, alpha, t)
     Lambda_bar::Array{ComplexF64, 3}      # (n, alpha, t)
     heff::Array{ComplexF64, 4}            # (n, a, b, t)
+    spin_spin_scale::Vector{Float64}
+    spin_bath_scale::Vector{Float64}
     scratch::Vector{OpenSpinsScratch}
     mcheck_endpoint_cache::McheckEndpointCache
     weight_history::Vector{Vector{Float64}}  # adaptive quadrature weights per upper index
@@ -643,6 +773,8 @@ end
 
 function initialize_state(params::OpenSpinsParameters, kernels::KernelBundle, init::OpenSpinsInitialState)
     ndiss = length(params.dissipative_spins)
+    spin_spin_scale = [params.spin_spin_profile(0.0)]
+    spin_bath_scale = [params.spin_bath_profile(0.0)]
 
     gK = GreenFunction(zeros(ComplexF64, params.n_spins, N_FIELD, N_FIELD, 1, 1), SymmetricSiteField)
     gs = GreenFunction(zeros(ComplexF64, params.n_spins, N_FIELD, N_FIELD, 1, 1), AntiSymmetricSiteField)
@@ -669,8 +801,9 @@ function initialize_state(params::OpenSpinsParameters, kernels::KernelBundle, in
     ds00 = zeros(ComplexF64, ndiss, N_COMP)
     for d in 1:ndiss, alpha in 1:N_COMP
         if kernels.has_channel[d, alpha]
-            dK00[d, alpha] = 2 * kernels.xiK_interp[d, alpha](0.0)
-            ds00[d, alpha] = 2 * kernels.xis_interp[d, alpha](0.0)
+            bath_scale_sq = spin_bath_scale[1]^2
+            dK00[d, alpha] = 2 * bath_scale_sq * kernels.xiK_interp[d, alpha](0.0)
+            ds00[d, alpha] = 2 * bath_scale_sq * kernels.xis_interp[d, alpha](0.0)
         end
     end
     dK[1, 1] = dK00
@@ -700,6 +833,8 @@ function initialize_state(params::OpenSpinsParameters, kernels::KernelBundle, in
         lambda_bar,
         Lambda_bar,
         heff,
+        spin_spin_scale,
+        spin_bath_scale,
         _make_thread_scratch(params.n_spins),
         McheckEndpointCache(),
         [Float64[]],
@@ -737,6 +872,78 @@ function _ensure_point_capacity!(state::SimulationState, tlen::Int)
         state.Lambda_bar = Lb_new
         state.heff = hf_new
     end
+    if length(state.spin_spin_scale) < target
+        resize!(state.spin_spin_scale, target)
+        resize!(state.spin_bath_scale, target)
+    end
+    return nothing
+end
+
+@inline _bath_data(bath::BathSpectrum) = (
+    spin = bath.spin,
+    component = bath.component,
+    gamma = bath.gamma,
+    s = bath.s,
+    omega_c = bath.omega_c,
+    temperature = bath.temperature,
+    omega_max = bath.omega_max,
+    n_omega = bath.n_omega,
+)
+
+function _parameters_data(params::OpenSpinsParameters)
+    return (
+        n_spins = params.n_spins,
+        h = copy(params.h),
+        J = copy(params.J),
+        dissipative_spins = copy(params.dissipative_spins),
+        baths = [_bath_data(bath) for bath in params.baths],
+        spin_spin_profile = interaction_profile_data(params.spin_spin_profile),
+        spin_bath_profile = interaction_profile_data(params.spin_bath_profile),
+        tmax = params.tmax,
+        dtini = params.dtini,
+        dtmax = params.dtmax,
+        atol = params.atol,
+        rtol = params.rtol,
+        kernel_ntau = params.kernel_ntau,
+        kernel_abstol = params.kernel_abstol,
+        kernel_reltol = params.kernel_reltol,
+        symmetry_tol = params.symmetry_tol,
+        output_basename = params.output_basename,
+    )
+end
+
+function OpenSpinsParameters(data::NamedTuple)
+    baths = [
+        BathSpectrum(
+            bath.spin,
+            bath.component;
+            gamma = bath.gamma,
+            s = bath.s,
+            omega_c = bath.omega_c,
+            temperature = bath.temperature,
+            omega_max = bath.omega_max,
+            n_omega = bath.n_omega,
+        ) for bath in data.baths
+    ]
+    return OpenSpinsParameters(
+        n_spins = data.n_spins,
+        h = data.h,
+        J = data.J,
+        dissipative_spins = data.dissipative_spins,
+        baths = baths,
+        spin_spin_profile = InteractionProfile(data.spin_spin_profile),
+        spin_bath_profile = InteractionProfile(data.spin_bath_profile),
+        tmax = data.tmax,
+        dtini = data.dtini,
+        dtmax = data.dtmax,
+        atol = data.atol,
+        rtol = data.rtol,
+        kernel_ntau = data.kernel_ntau,
+        kernel_abstol = data.kernel_abstol,
+        kernel_reltol = data.kernel_reltol,
+        symmetry_tol = data.symmetry_tol,
+        output_basename = data.output_basename,
+    )
 end
 
 function _trim_point_capacity!(state::SimulationState, tlen::Int)
@@ -757,6 +964,16 @@ function _trim_point_capacity!(state::SimulationState, tlen::Int)
         state.Lambda_bar = state.Lambda_bar[:, :, 1:tlen]
         state.heff = state.heff[:, :, :, 1:tlen]
     end
+    resize!(state.spin_spin_scale, tlen)
+    resize!(state.spin_bath_scale, tlen)
+    return nothing
+end
+
+@inline function _sync_profile_history!(state::SimulationState, ts, t1::Int, t2::Int)
+    state.spin_spin_scale[t1] = state.params.spin_spin_profile(ts[t1])
+    state.spin_bath_scale[t1] = state.params.spin_bath_profile(ts[t1])
+    state.spin_spin_scale[t2] = state.params.spin_spin_profile(ts[t2])
+    state.spin_bath_scale[t2] = state.params.spin_bath_profile(ts[t2])
     return nothing
 end
 
@@ -822,6 +1039,20 @@ end
         acc += j1 * m_data[m, p, delta, eta, t1, t2] * j2
     end
     return acc
+end
+
+@inline function _dressed_jmj_diag_entry(
+    m_data,
+    J::Array{Float64, 4},
+    n::Int,
+    alpha::Int,
+    beta::Int,
+    t1::Int,
+    t2::Int,
+    left_scale::Real,
+    right_scale::Real,
+)
+    return left_scale * right_scale * _jmj_diag_entry(m_data, J, n, alpha, beta, t1, t2)
 end
 
 # -----------------------------------------------------------------------------
@@ -910,9 +1141,10 @@ function _update_meanfield_propagator!(state::SimulationState, _ts::Vector{<:Rea
             if !equal_time
                 accs_hi = 0.0 + 0.0im
                 for s in 1:(t1 - 1)
+                    exchange_scale = state.spin_spin_scale[s]
                     inner = 0.0 + 0.0im
                     for gamma in 1:N_COMP, m in 1:n_spins, delta in 1:N_COMP
-                        jval = J[n, m, gamma, delta]
+                        jval = exchange_scale * J[n, m, gamma, delta]
                         iszero(jval) && continue
                         inner += omegas_data[n, alpha, gamma, t1, s] * jval * mchecks_data[m, np, delta, beta, s, t2]
                     end
@@ -921,9 +1153,10 @@ function _update_meanfield_propagator!(state::SimulationState, _ts::Vector{<:Rea
 
                 accs_lo = 0.0 + 0.0im
                 for s in 1:t2
+                    exchange_scale = state.spin_spin_scale[s]
                     inner = 0.0 + 0.0im
                     for gamma in 1:N_COMP, m in 1:n_spins, delta in 1:N_COMP
-                        jval = J[n, m, gamma, delta]
+                        jval = exchange_scale * J[n, m, gamma, delta]
                         iszero(jval) && continue
                         inner += omegas_data[n, alpha, gamma, t1, s] * jval * mchecks_data[m, np, delta, beta, s, t2]
                     end
@@ -957,9 +1190,10 @@ function _update_meanfield_propagator!(state::SimulationState, _ts::Vector{<:Rea
             row = _na_index(n, alpha)
             accK1 = 0.0 + 0.0im
             for s in 1:(t1 - 1)
+                exchange_scale = state.spin_spin_scale[s]
                 inner = 0.0 + 0.0im
                 for gamma in 1:N_COMP, m in 1:n_spins, delta in 1:N_COMP
-                    jval = J[n, m, gamma, delta]
+                    jval = exchange_scale * J[n, m, gamma, delta]
                     iszero(jval) && continue
                     inner += omegas_data[n, alpha, gamma, t1, s] * jval * mcheckK_data[m, np, delta, beta, s, t2]
                 end
@@ -968,9 +1202,10 @@ function _update_meanfield_propagator!(state::SimulationState, _ts::Vector{<:Rea
 
             accK2 = 0.0 + 0.0im
             for s in 1:t2
+                exchange_scale = state.spin_spin_scale[s]
                 inner = 0.0 + 0.0im
                 for gamma in 1:N_COMP, m in 1:n_spins, delta in 1:N_COMP
-                    jval = J[n, m, gamma, delta]
+                    jval = exchange_scale * J[n, m, gamma, delta]
                     iszero(jval) && continue
                     inner += omegaK_data[n, alpha, gamma, t1, s] * jval * mchecks_data[m, np, delta, beta, s, t2]
                 end
@@ -999,7 +1234,7 @@ function _update_meanfield_propagator!(state::SimulationState, _ts::Vector{<:Rea
     return nothing
 end
 
-@inline function _xiK(state::SimulationState, d::Int, alpha::Int, tau::Real)
+@inline function _xiK_base(state::SimulationState, d::Int, alpha::Int, tau::Real)
     t = Float64(tau)
     if t >= 0
         return state.kernels.xiK_interp[d, alpha](t)
@@ -1007,12 +1242,22 @@ end
     return -conj(state.kernels.xiK_interp[d, alpha](-t))
 end
 
-@inline function _xis(state::SimulationState, d::Int, alpha::Int, tau::Real)
+@inline function _xis_base(state::SimulationState, d::Int, alpha::Int, tau::Real)
     t = Float64(tau)
     if t >= 0
         return state.kernels.xis_interp[d, alpha](t)
     end
     return -conj(state.kernels.xis_interp[d, alpha](-t))
+end
+
+@inline function _xiK(state::SimulationState, d::Int, alpha::Int, ts, t1::Int, t2::Int)
+    scale = state.spin_bath_scale[t1] * state.spin_bath_scale[t2]
+    return scale * _xiK_base(state, d, alpha, ts[t1] - ts[t2])
+end
+
+@inline function _xis(state::SimulationState, d::Int, alpha::Int, ts, t1::Int, t2::Int)
+    scale = state.spin_bath_scale[t1] * state.spin_bath_scale[t2]
+    return scale * _xis_base(state, d, alpha, ts[t1] - ts[t2])
 end
 
 @inline function _solve_implicit_endpoint(rhs::ComplexF64, coeff::ComplexF64; eps::Float64 = 1e-12)
@@ -1048,7 +1293,7 @@ end
 
 function _mcheck_endpoint_factors!(state::SimulationState, w1, t1::Int)
     cache = state.mcheck_endpoint_cache
-    scale_s = Float64(2 * w1[t1])
+    scale_s = Float64(2 * w1[t1] * state.spin_spin_scale[t1])
     scale_k = scale_s
 
     if cache.row == t1 && cache.scale_s == scale_s && cache.scale_k == scale_k
@@ -1097,10 +1342,9 @@ function _update_bath_propagator!(state::SimulationState, ts::Vector{<:Real}, w1
             continue
         end
 
-        tau = ts[t1] - ts[t2]
-        xiK_t = _xiK(state, d, alpha, tau)
-        xis_t = _xis(state, d, alpha, tau)
-        xis_0 = _xis(state, d, alpha, 0.0)
+        xiK_t = _xiK(state, d, alpha, ts, t1, t2)
+        xis_t = _xis(state, d, alpha, ts, t1, t2)
+        xis_0 = _xis(state, d, alpha, ts, t1, t1)
         w_t1 = _weights_at(state, t1)
         w_t2 = _weights_at(state, t2)
         has_endpoint_xis = !iszero(xis_0)
@@ -1116,8 +1360,7 @@ function _update_bath_propagator!(state::SimulationState, ts::Vector{<:Real}, w1
             i00 = 0.0 + 0.0im
             for s1 in 1:(t1 - 1)
                 ws1 = _weights_at(state, s1)
-                tau1 = ts[t1] - ts[s1]
-                xis_t1s1 = _xis(state, d, alpha, tau1)
+                xis_t1s1 = _xis(state, d, alpha, ts, t1, s1)
                 inner = 0.0 + 0.0im
                 for s2 in 1:s1
                     inner += ws1[s2] * pis_data[d, alpha, s1, s2] * ds_data[d, alpha, s2, t2]
@@ -1135,8 +1378,7 @@ function _update_bath_propagator!(state::SimulationState, ts::Vector{<:Real}, w1
             i01 = 0.0 + 0.0im
             i01_tmax = has_endpoint_xis ? t1 : (t1 - 1)
             for s1 in 1:i01_tmax
-                tau1 = ts[t1] - ts[s1]
-                xis_t1s1 = _xis(state, d, alpha, tau1)
+                xis_t1s1 = _xis(state, d, alpha, ts, t1, s1)
                 inner = 0.0 + 0.0im
                 for s2 in 1:t2
                     inner += w_t2[s2] * pis_data[d, alpha, s1, s2] * ds_data[d, alpha, s2, t2]
@@ -1147,8 +1389,7 @@ function _update_bath_propagator!(state::SimulationState, ts::Vector{<:Real}, w1
             i10 = 0.0 + 0.0im
             for s1 in 1:t2
                 ws1 = _weights_at(state, s1)
-                tau1 = ts[t1] - ts[s1]
-                xis_t1s1 = _xis(state, d, alpha, tau1)
+                xis_t1s1 = _xis(state, d, alpha, ts, t1, s1)
                 inner = 0.0 + 0.0im
                 for s2 in 1:s1
                     inner += ws1[s2] * pis_data[d, alpha, s1, s2] * ds_data[d, alpha, s2, t2]
@@ -1158,8 +1399,7 @@ function _update_bath_propagator!(state::SimulationState, ts::Vector{<:Real}, w1
 
             i11 = 0.0 + 0.0im
             for s1 in 1:t2
-                tau1 = ts[t1] - ts[s1]
-                xis_t1s1 = _xis(state, d, alpha, tau1)
+                xis_t1s1 = _xis(state, d, alpha, ts, t1, s1)
                 inner = 0.0 + 0.0im
                 for s2 in 1:t2
                     inner += w_t2[s2] * pis_data[d, alpha, s1, s2] * ds_data[d, alpha, s2, t2]
@@ -1181,8 +1421,7 @@ function _update_bath_propagator!(state::SimulationState, ts::Vector{<:Real}, w1
         acc1 = 0.0 + 0.0im
         for s1 in 1:(t1 - 1)
             ws1 = _weights_at(state, s1)
-            tau1 = ts[t1] - ts[s1]
-            xis_t1s1 = _xis(state, d, alpha, tau1)
+            xis_t1s1 = _xis(state, d, alpha, ts, t1, s1)
             inner = 0.0 + 0.0im
             for s2 in 1:s1
                 inner += ws1[s2] * pis_data[d, alpha, s1, s2] * dK_data[d, alpha, s2, t2]
@@ -1202,8 +1441,7 @@ function _update_bath_propagator!(state::SimulationState, ts::Vector{<:Real}, w1
             ws1 = _weights_at(state, s1)
             inner = 0.0 + 0.0im
             for s2 in 1:s1
-                tau2 = ts[t1] - ts[s2]
-                inner += ws1[s2] * _xiK(state, d, alpha, tau2) * pis_data[d, alpha, s2, s1]
+                inner += ws1[s2] * _xiK(state, d, alpha, ts, t1, s2) * pis_data[d, alpha, s2, s1]
             end
             acc2 += w2[s1] * inner * ds_data[d, alpha, s1, t2]
         end
@@ -1211,8 +1449,7 @@ function _update_bath_propagator!(state::SimulationState, ts::Vector{<:Real}, w1
         acc3 = 0.0 + 0.0im
         acc3_tmax = has_endpoint_xis ? t1 : (t1 - 1)
         for s1 in 1:acc3_tmax
-            tau1 = ts[t1] - ts[s1]
-            xis_t1s1 = _xis(state, d, alpha, tau1)
+            xis_t1s1 = _xis(state, d, alpha, ts, t1, s1)
             inner = 0.0 + 0.0im
             for s2 in 1:t2
                 inner += w_t2[s2] * piK_data[d, alpha, s1, s2] * ds_data[d, alpha, s2, t2]
@@ -1244,12 +1481,18 @@ function _update_self_energies!(state::SimulationState, t1::Int, t2::Int)
     scratch = _scratch(state)
     jmjK = scratch.jmjK
     jmjs = scratch.jmjs
+    left_exchange_scale = state.spin_spin_scale[t1]
+    right_exchange_scale = state.spin_spin_scale[t2]
 
     for n in 1:n_spins
         d = state.kernels.spin_to_diss[n]
         @inbounds for alpha in 1:N_COMP, beta in 1:N_COMP
-            jmjK[alpha, beta] = _jmj_diag_entry(mK_data, J, n, alpha, beta, t1, t2)
-            jmjs[alpha, beta] = _jmj_diag_entry(ms_data, J, n, alpha, beta, t1, t2)
+            jmjK[alpha, beta] = _dressed_jmj_diag_entry(
+                mK_data, J, n, alpha, beta, t1, t2, left_exchange_scale, right_exchange_scale,
+            )
+            jmjs[alpha, beta] = _dressed_jmj_diag_entry(
+                ms_data, J, n, alpha, beta, t1, t2, left_exchange_scale, right_exchange_scale,
+            )
         end
 
         @inbounds for i in 1:N_FIELD, l in 1:N_FIELD
@@ -1306,6 +1549,7 @@ function _update_fields_diagonal!(state::SimulationState, ts::Vector{<:Real}, wd
     lambda_bar = state.lambda_bar
     Lambda_bar = state.Lambda_bar
     heff_data = state.heff
+    exchange_scale = state.spin_spin_scale[t]
 
     @inbounds for n in 1:n_spins, alpha in 1:N_COMP
         trval = 0.0 + 0.0im
@@ -1319,7 +1563,7 @@ function _update_fields_diagonal!(state::SimulationState, ts::Vector{<:Real}, wd
     for n in 1:n_spins, alpha in 1:N_COMP
         x = 0.0 + 0.0im
         for beta in 1:N_COMP, np in 1:n_spins
-            jval = state.params.J[n, np, alpha, beta]
+            jval = exchange_scale * state.params.J[n, np, alpha, beta]
             iszero(jval) && continue
             x += jval * tr_hist[np, beta, t]
         end
@@ -1331,8 +1575,7 @@ function _update_fields_diagonal!(state::SimulationState, ts::Vector{<:Real}, wd
         else
             y = 0.0 + 0.0im
             for s in 1:t
-                tau = ts[t] - ts[s]
-                y += wdiag[s] * _xis(state, d, alpha, tau) * tr_hist[n, alpha, s]
+                y += wdiag[s] * _xis(state, d, alpha, ts, t, s) * tr_hist[n, alpha, s]
             end
             lambda_bar[n, alpha, t] = 0.25im * y
         end
@@ -1377,6 +1620,7 @@ end
 
 function _update_auxiliaries!(state::SimulationState, ts::Vector{<:Real}, w1, w2, t1::Int, t2::Int)
     _ensure_point_capacity!(state, length(ts))
+    _sync_profile_history!(state, ts, t1, t2)
     _sync_weight_history!(state, w1, w2, t1, t2)
 
     if t2 == 1
@@ -1626,6 +1870,7 @@ function save_raw_output(path::AbstractString, params::OpenSpinsParameters, stat
 
     payload = (
         metadata = (
+            schema_version = 2,
             axis_order = (
                 g = "(n, a, b, t, t')",
                 sigma = "(n, a, b, t, t')",
@@ -1637,7 +1882,7 @@ function save_raw_output(path::AbstractString, params::OpenSpinsParameters, stat
             dissipative_spins = copy(params.dissipative_spins),
             component_labels = COMP_LABELS,
         ),
-        params = params,
+        params = _parameters_data(params),
         t = copy(solution.t),
         gK = gK_full,
         gs = gs_full,
@@ -1719,6 +1964,7 @@ function run_simulation(
         atol = params.atol,
         rtol = params.rtol,
         dtini = params.dtini,
+        dtmax = params.dtmax,
         stop = stop,
     )
     _trim_point_capacity!(state, length(sol.t))
@@ -1744,5 +1990,3 @@ function run_simulation(
         spin_expectation = spin_expectation_from_gk(state.gK.data[:, :, :, 1:length(sol.t), 1:length(sol.t)]),
     )
 end
-
-include("Postprocess.jl")

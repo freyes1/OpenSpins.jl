@@ -20,6 +20,10 @@ include("OpenSpins_impl.jl")
 include("Postprocess.jl")
 
 export BathSpectrum
+export InteractionProfile
+export Quench
+export LinearRamp
+export SmoothRamp
 export OpenSpinsParameters
 export OpenSpinsInitialState
 export run_simulation
